@@ -18,7 +18,8 @@ from script import LINES
 
 FPS = 12
 BUILD = os.path.join(ROOT, "build", "ep001")
-AUDIO = os.path.join(BUILD, "audio")
+# Final dialogue takes (ElevenLabs via vidIQ; see voices/CAST.md). One trimmed wav per line id.
+VOICES = os.path.join(ROOT, "voices", "ep001", "wav")
 
 # ------------------------------------------------------------------ timing
 # Line start times (seconds). Pauses are the comedy; tune here.
@@ -47,37 +48,64 @@ SHOTS = [  # (start, name)
 END = 33.45
 SFX_CAPTION = (32.30, 33.45, "[card declined]")
 
+# Every beat above is written against these "layout" line lengths. When real takes
+# run longer or shorter, the timeline is warped: spoken spans stretch to fit the
+# take, every pause between lines keeps its exact length.
+LAYOUT_DUR = {"r1": 1.80, "g1": 1.11, "r2": 0.54, "g2": 1.08, "r3": 0.97, "g3": 0.83,
+              "g4": 1.55, "r4": 1.31, "g5": 1.18, "g6": 0.58, "g7": 2.38}
+
 DUR = {}
 ENV = {}
+WARP_OLD, WARP_NEW = [0.0], [0.0]
+
+
+def to_new(t):
+    return float(np.interp(t, WARP_OLD, WARP_NEW))
+
+
+def to_old(T):
+    return float(np.interp(T, WARP_NEW, WARP_OLD))
+
+
+def build_warp():
+    shift = 0.0
+    for lid in sorted(START, key=START.get):
+        s, od, nd = START[lid], LAYOUT_DUR[lid], DUR[lid]
+        WARP_OLD.append(s); WARP_NEW.append(s + shift)
+        shift += nd - od
+        WARP_OLD.append(s + od); WARP_NEW.append(s + od + shift)
+    WARP_OLD.append(END + 1); WARP_NEW.append(END + 1 + shift)
 
 
 def load_audio():
-    meta = json.load(open(os.path.join(AUDIO, "durations.json")))
-    for lid, m in meta.items():
-        DUR[lid] = m["dur"]
-        x, sr = sf.read(os.path.join(AUDIO, f"{lid}.wav"), dtype="float32")
+    for lid, _, _ in LINES:
+        x, sr = sf.read(os.path.join(VOICES, f"{lid}.wav"), dtype="float32")
+        DUR[lid] = len(x) / sr
         hop = sr // FPS
         n = int(math.ceil(len(x) / hop))
         rms = np.array([np.sqrt(np.mean(x[i * hop:(i + 1) * hop] ** 2) + 1e-9) for i in range(n)])
         ENV[lid] = rms / (rms.max() + 1e-9)
+    build_warp()
 
 
 def speaking(t, who):
+    T = to_new(t)
     for lid, spk, _ in LINES:
         if spk != who:
             continue
-        s = START[lid]
-        if s <= t < s + DUR[lid]:
-            i = int((t - s) * FPS)
+        s = to_new(START[lid])
+        if s <= T < s + DUR[lid]:
+            i = int((T - s) * FPS)
             e = ENV[lid][min(i, len(ENV[lid]) - 1)]
             return 0 if e < 0.18 else (1 if e < 0.55 else 2)
     return 0
 
 
 def subtitle(t):
+    T = to_new(t)
     for lid, spk, text in LINES:
-        s = START[lid]
-        if s - 0.04 <= t < s + DUR[lid] + 0.22:
+        s = to_new(START[lid])
+        if s - 0.04 <= T < s + DUR[lid] + 0.22:
             return text
     a, b, txt = SFX_CAPTION
     if a <= t < b:
@@ -478,7 +506,7 @@ def draw_subtitle(canvas, text):
 
 def render_frame(i):
     import skia
-    t = i / FPS
+    t = to_old(i / FPS)   # animation runs in layout time
     st, name = shot_at(t)
     if name == "BLACK":
         surf = skia.Surface(W, H)
@@ -514,7 +542,7 @@ def render_frame(i):
 # ------------------------------------------------------------------ audio
 def build_audio(path):
     sr = 48000
-    n = int(END * sr)
+    n = int(to_new(END) * sr)
     mix = np.zeros(n, np.float32)
 
     def place(x, t, gain=1.0, src_sr=sr):
@@ -527,12 +555,16 @@ def build_audio(path):
             mix[a:b] += x[: b - a] * gain
 
     black_t = [s for s, nme in SHOTS if nme == "BLACK"][0]
-    room = sfx.room_tone(black_t, sr)
+    room = sfx.room_tone(to_new(black_t), sr)
     place(room, 0, 1.0)
     for lid, spk, _ in LINES:
-        x, xsr = sf.read(os.path.join(AUDIO, f"{lid}.wav"), dtype="float32")
+        x, xsr = sf.read(os.path.join(VOICES, f"{lid}.wav"), dtype="float32")
         x = x / (np.abs(x).max() + 1e-9) * 0.62
-        place(x, START[lid], 1.0, xsr)
+        place(x, to_new(START[lid]), 1.0, xsr)
+    _place = place
+
+    def place(x, t, gain=1.0, src_sr=sr):  # SFX cue times are written in layout time
+        _place(x, to_new(t), gain, src_sr)
     for k, ts in enumerate((0.05, 0.22, 0.40, 0.57)):
         place(sfx.footstep(sr, k), ts, 0.30)
     place(sfx.paper_bag(sr), 2.62, 0.45)
@@ -557,13 +589,11 @@ def main():
     ap.add_argument("--to", dest="t1", type=float, default=END)
     args = ap.parse_args()
     os.makedirs(BUILD, exist_ok=True)
-    import voice
-    voice.record(LINES, AUDIO)
     load_audio()
     if args.stills:
         from PIL import Image
         times = [0.3, 1.5, 4.0, 5.9, 7.0, 9.0, 11.3, 13.0, 14.8, 15.8, 17.2, 18.3, 20.0, 22.3, 24.5, 24.95, 25.9, 27.2, 29.0, 30.7, 32.5]
-        ims = [Image.fromarray(render_frame(int(round(tt * FPS)))).convert("RGB").resize((270, 480)) for tt in times]
+        ims = [Image.fromarray(render_frame(int(round(to_new(tt) * FPS)))).convert("RGB").resize((270, 480)) for tt in times]
         cols = 7
         sheet = Image.new("RGB", (cols * 270, ((len(ims) + cols - 1) // cols) * 480), "white")
         for k, im in enumerate(ims):
@@ -574,10 +604,11 @@ def main():
     wav = os.path.join(BUILD, "mix.wav")
     build_audio(wav)
     out = os.path.join(BUILD, "FunctioningAdults_E001_TheRobbery.mp4")
-    nframes = int(round(END * FPS))
+    end = to_new(END)
+    nframes = int(round(end * FPS))
     cmd = ["ffmpeg", "-y", "-loglevel", "error", "-f", "rawvideo", "-pix_fmt", "rgba", "-s", f"{W}x{H}", "-framerate", str(FPS),
            "-i", "-", "-i", wav, "-vf", "fps=24,format=yuv420p", "-c:v", "libx264", "-preset", "medium", "-crf", "18",
-           "-tune", "animation", "-af", "volume=5.5dB,alimiter=limit=0.76:level=false", "-c:a", "aac", "-b:a", "192k", "-t", f"{END:.3f}", "-movflags", "+faststart", out]
+           "-tune", "animation", "-af", "volume=5.5dB,alimiter=limit=0.66:level=false", "-c:a", "aac", "-b:a", "192k", "-t", f"{end:.3f}", "-movflags", "+faststart", out]
     proc = subprocess.Popen(cmd, stdin=subprocess.PIPE)
     for i in range(nframes):
         proc.stdin.write(render_frame(i).tobytes())
@@ -594,7 +625,9 @@ def write_srt(path):
         h, m = int(x // 3600), int(x % 3600 // 60)
         s = x % 60
         return f"{h:02d}:{m:02d}:{int(s):02d},{int(round((s - int(s)) * 1000)):03d}"
-    rows = [(START[l], START[l] + DUR[l] + 0.22, txt) for l, _, txt in LINES] + [SFX_CAPTION]
+    a, b, cap = SFX_CAPTION
+    rows = [(to_new(START[l]), to_new(START[l]) + DUR[l] + 0.22, txt) for l, _, txt in LINES] + [(to_new(a), to_new(b), cap)]
+    rows = [(a, min(b, rows[k + 1][0] - 0.02) if k + 1 < len(rows) else b, txt) for k, (a, b, txt) in enumerate(rows)]
     with open(path, "w") as f:
         for k, (a, b, txt) in enumerate(rows, 1):
             f.write(f"{k}\n{ts(a)} --> {ts(b)}\n{txt}\n\n")
